@@ -1,0 +1,1430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Operation: Riptide</title>
+<!-- Portrait lock, no pinch-zoom, no scroll-bounce (phone-tax checklist). -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<style>
+  :root{
+    --ink:#dfe8ec; --dim:#6b7a83; --amber:#ffbf47; --red:#e8412f; --bg:#0b1016;
+  }
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body{
+    margin:0; padding:0; width:100%; height:100%;
+    background:var(--bg); color:var(--ink);
+    overflow:hidden; overscroll-behavior:none; touch-action:none;
+    font-family:-apple-system,"SF Mono",Menlo,monospace;
+  }
+  #wrap{ position:fixed; inset:0; }
+  canvas{ display:block; touch-action:none; }
+
+  /* --- HTML overlays for menu / results (canvas draws the play HUD) --- */
+  .overlay{
+    position:fixed; inset:0; z-index:5;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:14px; text-align:center; padding:28px;
+    background:rgba(8,12,16,0.86);
+  }
+  .overlay.hidden{ display:none; }
+  .kicker{ font-size:12px; letter-spacing:5px; color:var(--red); text-transform:uppercase; }
+  .overlay h1{ margin:0; font-size:30px; letter-spacing:6px; color:var(--amber);
+    font-weight:700; text-transform:uppercase; }
+  .overlay p{ margin:0; font-size:13px; letter-spacing:1.5px; color:var(--dim);
+    text-transform:uppercase; line-height:1.7; max-width:300px; }
+  .stat{ font-size:15px; letter-spacing:2px; color:var(--ink); }
+  .cta{ margin-top:10px; font-size:13px; letter-spacing:3px; color:var(--ink);
+    text-transform:uppercase; border:1px solid var(--amber); padding:12px 26px; }
+  /* hard-edged corner-bracket frame around the title block (military motif) */
+  .frame{ position:relative; padding:26px 30px; }
+  .frame::before,.frame::after{ content:""; position:absolute; width:18px; height:18px;
+    border:2px solid var(--amber); }
+  .frame::before{ top:0; left:0; border-right:none; border-bottom:none; }
+  .frame::after{ bottom:0; right:0; border-left:none; border-top:none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+
+<div id="menu" class="overlay">
+  <div class="frame">
+    <div class="kicker">★ Sector 1 — Coastal Approach</div>
+    <h1>Operation<br>Riptide</h1>
+  </div>
+  <p>Drag to fly · guns fire automatically<br>Dodge fire · destroy the intruders</p>
+  <div class="cta">Tap to begin</div>
+</div>
+
+<div id="results" class="overlay hidden">
+  <div class="frame">
+    <div class="kicker" id="resKicker">★</div>
+    <h1 id="resTitle">Shot Down</h1>
+  </div>
+  <div class="stat" id="resScore">SCORE 0</div>
+  <div class="cta">Tap to retry</div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // =====================================================================
+  // ===== TUNE THIS (Patrick) ===========================================
+  // Every number/colour that controls how the game LOOKS and FEELS lives
+  // here. Change a value, reload, and it changes — nothing else to touch.
+  // Colours are hex strings. Speeds are pixels-per-second. Times are seconds.
+  // =====================================================================
+  var TUNE = {
+    // -- palette: muted military world; RED + ORANGE are the ONLY loud colours (= danger/impact) --
+    seaTop:      "#132230",   // sky/sea gradient, top
+    seaBottom:   "#1b3446",   // sky/sea gradient, bottom
+    land:        "#37472f",   // muted forest green landmass
+    sand:        "#6f6549",   // muted sandy beige coastline
+    landEdge:    "#26301f",   // darker landmass outline / contour
+    speck:       "#22303b",   // faint background texture flecks
+
+    player:      "#ffb43a",   // YOUR plane — the only warm thing in the sky
+    playerHi:    "#ffd884",   // player cockpit highlight
+    playerShot:  "#ffe08a",   // your bullets (amber tracer)
+
+    enemy:       "#6b7580",   // enemy jets — cold gunmetal
+    enemyEdge:   "#464e57",   // enemy outline
+    star:        "#d23b2f",   // red star marking on enemy
+    enemyShot:   "#ff3b4d",   // enemy bullets = DANGER red
+
+    fire:        "#ff7a2a",   // explosion orange
+    spark:       "#ffd25a",   // explosion bright spark
+    hudAmber:    "#ffbf47",   // HUD instrumentation
+    hudDim:      "#5c6b74",   // HUD inactive
+    warnRed:     "#e8412f",   // low-armour warning
+
+    // -- player feel --
+    playerFingerOffset: 60,   // plane floats this many px ABOVE your finger (so your thumb never hides it)
+    playerFollow:       0.35, // how snappily the plane chases your finger (0=frozen, 1=instant)
+    playerRadius:       15,   // collision size
+    playerHP:           100,
+    fireInterval:       0.14, // seconds between your auto-shots (lower = faster gun)
+    playerBulletSpeed:  560,
+    playerBulletDamage: 10,
+
+    // -- enemy feel --
+    enemyRadius:        16,
+    enemyHP:            30,   // = 3 of your shots
+    enemySpeed:         150,  // downward
+    enemySway:          46,   // side-to-side wander amplitude
+    enemyFireEvery:     1.6,  // seconds between an enemy's shots
+    enemyBulletSpeed:   300,
+    enemyBulletDamage:  10,
+    contactDamage:      25,   // damage if an enemy crashes into you
+
+    // -- enemy roster (build 3): per-type stats --
+    heliHP:  45,  heliSpeed: 70,  heliFireEvery: 1.9,   // helicopter — slow, fires aimed bursts (air)
+    tankHP:  60,  tankFireEvery: 2.2,                    // tank — tough, straight shells (ground)
+    samHP:   40,  samFireEvery:  3.4,                    // SAM — fires a tracked homing missile (ground)
+
+    // -- tracked missile (build 3) --
+    missileSpeed:  190,   // homing-missile travel speed
+    missileTurn:   2.4,   // radians/sec turn rate (lower = easier to out-turn/dodge)
+    missileDamage: 18,
+    missileLife:   6.0,   // seconds before it fizzles out
+
+    // -- player weapons (build 4) --
+    a2aAmmo:      8,      // heat-seeker (air-to-air) missiles per run
+    a2aSpeed:     440,
+    a2aTurn:      5.5,    // rad/s — locks on hard
+    a2aDamage:    34,     // one-shots a fighter (30hp), softens a heli
+    a2aCooldown:  0.3,    // min seconds between launches
+    flareCharges: 4,      // countermeasure pops per run
+    flareCooldown: 0.8,
+
+    // -- miniboss: alien laser/shield node (build 5) --
+    bossCoreHp:    600,   // the exposed core (kill last)
+    bossShieldHp:  180,   // shield generator pod — destroy FIRST
+    bossLaserRate: 0.55,  // rad/s beam rotation
+    bossLaserDmg:  30,    // damage/sec while you're in a beam
+    bossLaserWidth: 13,   // beam half-width (px)
+    bossFireEvery: 1.7,   // aimed shots at you
+    bossContactDmg: 45,   // damage/sec touching the core body
+
+    // -- canyon-run escape (build 6) --
+    canyonSpeed:    340,   // fast scroll during the escape
+    canyonLength:   3200,  // px of run before you break out to sea
+    canyonWallDmg:  35,    // damage/sec scraping a canyon wall
+    obstacleEvery:  0.7,   // seconds between rock spires
+    rockColor:      "#4a4136",
+    rockEdge:       "#2e2820",
+
+    // -- mission bookends (build 7) --
+    launchTime:   2.2,    // catapult launch seconds (no control)
+    landHoldTime: 1.8,    // seconds aligned in the corridor to touch down
+
+    // -- scoring --
+    scorePerKill:       100,
+
+    // -- juice / feel (build 2) --
+    shakeOnKill:        4,     // screen-shake px when an enemy dies
+    shakeOnHit:         12,    // screen-shake px when YOU get hit
+    shakeOnBomb:        22,    // screen-shake px on a bomb
+    hitStopOnKill:      0.035, // seconds the frame freezes on a kill (impact weight)
+    trailLife:          0.35,  // seconds an engine-trail puff lingers
+
+    // -- special weapon: the bomb (build 2) --
+    startBombs:         3,     // charges per run
+    bombDamage:         60,    // damage dealt to every enemy on screen
+
+    // -- world --
+    scrollSpeed:        90,   // how fast the terrain slides past (sense of speed)
+
+    // -- the LEVEL, as data: {t: seconds-into-run, x: 0..1 across screen}.
+    //    Add/remove/re-time rows to redesign the wave. This is where levels live. --
+    //    `type`: fighter (default) | heli | tank | sam. tank/sam are GROUND (scroll with terrain).
+    level: [
+      {t:1.5, x:0.50, type:'fighter'}, {t:3.0, x:0.30, type:'fighter'}, {t:3.4, x:0.70, type:'heli'},
+      {t:5.5, x:0.20, type:'tank'},    {t:6.0, x:0.80, type:'tank'},    {t:6.8, x:0.50, type:'sam'},
+      {t:9.0, x:0.35, type:'fighter'}, {t:9.4, x:0.65, type:'fighter'}, {t:10.5, x:0.50, type:'heli'},
+      {t:13.0, x:0.15, type:'sam'},    {t:13.6, x:0.85, type:'sam'},    {t:14.2, x:0.50, type:'tank'},
+      {t:17.0, x:0.30, type:'heli'},   {t:17.6, x:0.70, type:'fighter'},{t:18.4, x:0.50, type:'tank'},
+      {t:21.0, x:0.25, type:'sam'},    {t:21.6, x:0.55, type:'fighter'},{t:22.2, x:0.80, type:'heli'}
+    ]
+  };
+  // =====================================================================
+  // ===== END TUNE ======================================================
+  // Below here is the machinery. You never need to edit it to change feel.
+  // =====================================================================
+
+  // Mission dialogue + radio comms (build 8) — see GDD Appendix B
+  var BRIEF = [
+    { s:"COMMANDER", t:"Their coastal early-warning net sees anything that crosses the water. Blind it and the corridor opens." },
+    { s:"PILOT",     t:"Suppression?" },
+    { s:"SUPPORT",   t:"Radar station, three SAM sites. Take them down and the approach goes dark." },
+    { s:"COMMANDER", t:"One anomaly. A defence node is drawing power we can't identify." },
+    { s:"PILOT",     t:"Alien technology?" },
+    { s:"SUPPORT",   t:"Unknown. Treat it as hostile and hard." },
+    { s:"COMMANDER", t:"Kill the net, kill the node, come home." },
+    { s:"PILOT",     t:"Understood." }
+  ];
+  var COMMS = [
+    { t:3.0,  s:"SUPPORT",   x:"SAM sites acquiring. Keep moving." },
+    { t:12.0, s:"COMMANDER", x:"Interceptors inbound — push through.", reinforce:true },
+    { t:20.0, s:"SUPPORT",   x:"Net's nearly down. Watch for the anomaly." }
+  ];
+
+
+  // ===== SETUP: canvas + retina DPI (phone-tax) ========================
+  var canvas = document.getElementById("game");
+  var ctx = canvas.getContext("2d");
+  var W, H, DPR;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 3);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  var menuEl = document.getElementById("menu");
+  var resultsEl = document.getElementById("results");
+  var resTitle = document.getElementById("resTitle");
+  var resKicker = document.getElementById("resKicker");
+  var resScore = document.getElementById("resScore");
+
+
+  // ===== HELPERS =======================================================
+  function clamp(v, lo, hi){ return v < lo ? lo : (v > hi ? hi : v); }
+  function rand(a, b){ return a + Math.random() * (b - a); }
+
+  // Pre-rendered radial-glow sprite (capped-glow policy: cheap additive blit,
+  // NOT per-entity shadowBlur, which murders mobile framerate).
+  function makeGlow(hex, radius){
+    var s = radius * 2;
+    var oc = document.createElement("canvas");
+    oc.width = s; oc.height = s;
+    var g = oc.getContext("2d");
+    var grd = g.createRadialGradient(radius, radius, 0, radius, radius, radius);
+    grd.addColorStop(0, hex);
+    grd.addColorStop(0.4, hex);
+    grd.addColorStop(1, "rgba(0,0,0,0)");
+    g.globalAlpha = 0.9;
+    g.fillStyle = grd;
+    g.fillRect(0, 0, s, s);
+    return oc;
+  }
+  var glowPlayer = makeGlow(TUNE.playerShot, 10);
+  var glowEnemy  = makeGlow(TUNE.enemyShot, 11);
+  var glowSpark  = makeGlow(TUNE.spark, 14);
+  function blitGlow(sprite, x, y, scale){
+    var w = sprite.width * scale, h = sprite.height * scale;
+    ctx.drawImage(sprite, x - w/2, y - h/2, w, h);
+  }
+
+  // Dead-slot reuse ("pool"): grab a dead object to refill, else grow the array.
+  // Keeps allocation/GC out of the hot loop without a heavy pool abstraction.
+  function acquire(arr){
+    for (var i = 0; i < arr.length; i++) if (arr[i].dead) return arr[i];
+    var o = { dead:true };
+    arr.push(o);
+    return o;
+  }
+
+
+  // ===== STATE =========================================================
+  var state = "menu"; // menu | play | results
+  var score = 0;
+  var elapsed = 0;      // seconds since this run started
+  var spawnCursor = 0;  // index into TUNE.level
+  var hitFlash = 0;     // screen flash timer (damage or bomb)
+  var flashColor = "232,65,47";  // rgb of the current flash — red for damage, amber for the bomb
+
+  var player = { x:0, y:0, hp:TUNE.playerHP };
+  var target = { x:0, y:0 };
+  var fireTimer = 0;
+
+  var bullets = [];      // your shots
+  var enemyBullets = [];
+  var enemies = [];
+  var particles = [];
+  var rings = [];        // expanding shockwave rings (build 2)
+  var trails = [];       // engine-trail puffs (build 2)
+  var missiles = [];     // enemy tracked homing missiles (build 3)
+  var playerMissiles = []; // your heat-seekers (build 4)
+  var a2aAmmo = TUNE.a2aAmmo, a2aTimer = 0;
+  var flares = TUNE.flareCharges, flareTimer = 0;
+  var boss = null, bossSpawned = false;  // the miniboss (build 5)
+  var phase = 'combat';                  // launch | combat | canyon | landing (build 6/7)
+  var canyonScroll = 0, canyonDist = 0, obstacles = [], obstacleTimer = 0;
+  var combatTime = 0, launchTimer = 0, landHold = 0;  // build 7: spawn clock / bookend timers
+  var briefIndex = 0, commCursor = 0, radioTimer = 0, radioText = "", radioSpeaker = "";  // build 8
+  var bombs = TUNE.startBombs;  // special-weapon charges
+  var shake = 0;         // current screen-shake magnitude (decays each frame)
+  var hitStop = 0;       // seconds of frozen frames for impact weight
+
+  // scrolling terrain features (fake terrain — no tile system in build 1)
+  var scrollY = 0;
+  var islands = [];
+  var specks = [];
+  function seedTerrain(){
+    islands.length = 0;
+    for (var i = 0; i < 5; i++){
+      islands.push({
+        x: rand(0.1, 0.9), w: rand(90, 190), h: rand(120, 240),
+        y: rand(-H, H), sand: rand(10, 22)
+      });
+    }
+    specks.length = 0;
+    for (var j = 0; j < 26; j++){
+      specks.push({ x: rand(0, 1), y: rand(0, H), s: rand(1, 3) });
+    }
+  }
+  seedTerrain();
+
+
+  // ===== INPUT: single-touch drag (+mouse), passive:false ==============
+  var dragging = false;
+  var activeId = null;
+
+  function setTarget(px, py){
+    target.x = px;
+    target.y = py - TUNE.playerFingerOffset; // fly ABOVE the finger
+  }
+  // thumb-corner weapon buttons (build 4)
+  function a2aButton(){   return { x: W - 52, y: H - 66,  r: 30 }; }  // heat-seeker (A2A)
+  function flareButton(){ return { x: 52,     y: H - 66,  r: 30 }; }  // countermeasure
+  function bombButton(){  return { x: W - 52, y: H - 140, r: 28 }; }  // bomb (moved up)
+  function btnHit(px, py, b){ return (px - b.x)*(px - b.x) + (py - b.y)*(py - b.y) <= b.r*b.r; }
+  function startBriefing(){ state = "briefing"; briefIndex = 1; menuEl.classList.add("hidden"); resultsEl.classList.add("hidden"); }
+  function advanceBriefing(){ if (briefIndex < BRIEF.length) briefIndex++; else startGame(); }
+  function handleDown(px, py, id){
+    if (state === "menu"){ startBriefing(); return; }         // menu → briefing
+    if (state === "briefing"){ advanceBriefing(); return; }   // reveal lines → launch
+    if (state === "results"){ startGame(); return; }          // retry (skip briefing)
+    if (state !== "play") return;
+    if (phase === 'launch') return;                 // no control during the catapult
+    if (phase === 'combat' || phase === 'canyon'){  // weapons only in the fight
+      if (btnHit(px, py, a2aButton()))   { fireA2A();  return; }
+      if (btnHit(px, py, flareButton())) { useFlare(); return; }
+      if (btnHit(px, py, bombButton()))  { useBomb();  return; }
+    }
+    dragging = true; activeId = id;
+    setTarget(px, py);
+  }
+  function handleMove(px, py){ if (dragging) setTarget(px, py); }
+  function handleUp(){ dragging = false; activeId = null; }
+
+  // touch
+  canvas.addEventListener("touchstart", function(e){
+    e.preventDefault();
+    if (activeId !== null) return;               // lock to the first finger only
+    var t = e.changedTouches[0];
+    handleDown(t.clientX, t.clientY, t.identifier);
+  }, { passive:false });
+  canvas.addEventListener("touchmove", function(e){
+    e.preventDefault();
+    for (var i = 0; i < e.changedTouches.length; i++){
+      var t = e.changedTouches[i];
+      if (t.identifier === activeId){ handleMove(t.clientX, t.clientY); break; }
+    }
+  }, { passive:false });
+  function onTouchEnd(e){
+    for (var i = 0; i < e.changedTouches.length; i++){
+      if (e.changedTouches[i].identifier === activeId){ handleUp(); break; }
+    }
+  }
+  canvas.addEventListener("touchend", onTouchEnd, { passive:false });
+  canvas.addEventListener("touchcancel", onTouchEnd, { passive:false });
+  // mouse (desktop preview)
+  canvas.addEventListener("mousedown", function(e){ handleDown(e.clientX, e.clientY, "mouse"); });
+  window.addEventListener("mousemove", function(e){ handleMove(e.clientX, e.clientY); });
+  window.addEventListener("mouseup", handleUp);
+  // overlays also count as a tap-to-start
+  menuEl.addEventListener("pointerdown", function(){ if (state==="menu") startBriefing(); });
+  resultsEl.addEventListener("pointerdown", function(){ if (state==="results") startGame(); });
+
+  // Pause + reset the clock when the tab backgrounds (iOS suspends rAF; the
+  // first frame back would otherwise be one giant dt → spawn flood / teleport).
+  document.addEventListener("visibilitychange", function(){
+    if (!document.hidden) lastT = null;
+  });
+
+
+  // ===== SPAWNING ======================================================
+  function spawnEnemy(xFrac, type){
+    var e = acquire(enemies);
+    e.dead = false;
+    e.type = type || 'fighter';
+    e.x = xFrac * W; e.baseX = e.x; e.y = -30;
+    e.phase = rand(0, Math.PI * 2);
+    e.r = TUNE.enemyRadius;
+    if (e.type === 'heli')      { e.hp = TUNE.heliHP; e.ground = false; e.r = 18; e.fire = rand(0.6, TUNE.heliFireEvery); }
+    else if (e.type === 'tank') { e.hp = TUNE.tankHP; e.ground = true;  e.r = 20; e.fire = rand(0.8, TUNE.tankFireEvery); }
+    else if (e.type === 'sam')  { e.hp = TUNE.samHP;  e.ground = true;  e.r = 18; e.fire = rand(1.0, TUNE.samFireEvery); }
+    else                        { e.hp = TUNE.enemyHP; e.ground = false; e.r = TUNE.enemyRadius; e.fire = rand(0.5, TUNE.enemyFireEvery); }
+  }
+  function firePlayer(){
+    var b = acquire(bullets);
+    b.dead = false;
+    b.x = player.x; b.y = player.y - 20;
+    b.vy = -TUNE.playerBulletSpeed; b.r = 4;
+    // muzzle flash (build 2)
+    var f = acquire(particles);
+    f.dead = false; f.x = player.x; f.y = player.y - 20; f.vx = 0; f.vy = -40;
+    f.life = f.max = 0.06; f.size = 5; f.color = TUNE.playerShot;
+  }
+  function fireEnemy(e){        // straight-down shell (fighter, tank)
+    var b = acquire(enemyBullets);
+    b.dead = false;
+    b.x = e.x; b.y = e.y + 16;
+    b.vx = 0; b.vy = TUNE.enemyBulletSpeed; b.r = 5;
+  }
+  function fireEnemyAimed(e){   // aimed at the player (helicopter)
+    var b = acquire(enemyBullets);
+    b.dead = false;
+    b.x = e.x; b.y = e.y + 14;
+    var dx = player.x - e.x, dy = player.y - e.y, d = Math.hypot(dx, dy) || 1;
+    b.vx = dx / d * TUNE.enemyBulletSpeed; b.vy = dy / d * TUNE.enemyBulletSpeed; b.r = 5;
+  }
+  function fireMissile(e){      // SAM → tracked homing missile (build 3)
+    var m = acquire(missiles);
+    m.dead = false;
+    m.x = e.x; m.y = e.y + 14; m.ang = Math.PI / 2;  // launches downward, then homes
+    m.life = TUNE.missileLife; m.r = 6;
+  }
+  function explode(x, y, color, count){
+    for (var i = 0; i < count; i++){
+      var p = acquire(particles);
+      p.dead = false;
+      var a = rand(0, Math.PI * 2), sp = rand(40, 220);
+      p.x = x; p.y = y;
+      p.vx = Math.cos(a) * sp; p.vy = Math.sin(a) * sp;
+      p.life = p.max = rand(0.3, 0.7);
+      p.size = rand(2, 5);
+      p.color = color;
+    }
+  }
+  // -- build 2 juice helpers --
+  function spawnRing(x, y, color, maxR){
+    var r = acquire(rings);
+    r.dead = false; r.x = x; r.y = y; r.r = 6; r.maxR = maxR;
+    r.life = r.max = 0.4; r.color = color;
+  }
+  function emitTrail(x, y, color, size){
+    var tr = acquire(trails);
+    tr.dead = false; tr.x = x; tr.y = y;
+    tr.life = tr.max = TUNE.trailLife; tr.size = size; tr.color = color;
+  }
+  // one satisfying explosion: sparks + fire + shockwave ring + shake + hit-stop
+  function kaboom(x, y, big){
+    explode(x, y, TUNE.fire, big ? 20 : 14);
+    explode(x, y, TUNE.spark, big ? 10 : 6);
+    spawnRing(x, y, TUNE.fire, big ? 100 : 55);
+    shake = Math.max(shake, big ? TUNE.shakeOnHit : TUNE.shakeOnKill);
+    hitStop = Math.max(hitStop, TUNE.hitStopOnKill);
+  }
+  // special weapon: clear incoming fire + damage every enemy on screen
+  function useBomb(){
+    if (bombs <= 0) return;
+    bombs--;
+    shake = Math.max(shake, TUNE.shakeOnBomb);
+    hitFlash = 0.18; flashColor = "255,190,70";   // amber — YOUR blast, not damage
+    for (var i = 0; i < enemyBullets.length; i++) enemyBullets[i].dead = true;
+    for (var e = 0; e < enemies.length; e++){
+      var en = enemies[e]; if (en.dead || en.y < 0 || en.y > H) continue;
+      en.hp -= TUNE.bombDamage;
+      spawnRing(en.x, en.y, TUNE.fire, 60);
+      if (en.hp <= 0){ en.dead = true; score += TUNE.scorePerKill; kaboom(en.x, en.y, false); }
+    }
+    spawnRing(player.x, player.y, TUNE.spark, Math.max(W, H));  // screen-wide flash ring
+  }
+  // -- build 4: player weapons --
+  function nearestAir(fromX, fromY){   // nearest AIR enemy ahead (above the point)
+    var best = null, bd = 1e9;
+    for (var i = 0; i < enemies.length; i++){
+      var e = enemies[i]; if (e.dead || e.ground || e.y > fromY) continue;
+      var d = (e.x - fromX)*(e.x - fromX) + (e.y - fromY)*(e.y - fromY);
+      if (d < bd){ bd = d; best = e; }
+    }
+    return best;
+  }
+  function fireA2A(){                   // heat-seeker: locks the nearest air enemy
+    if (a2aAmmo <= 0 || a2aTimer > 0) return;
+    a2aAmmo--; a2aTimer = TUNE.a2aCooldown;
+    var m = acquire(playerMissiles);
+    m.dead = false; m.x = player.x; m.y = player.y - 18; m.ang = -Math.PI/2;
+    m.target = nearestAir(player.x, player.y); m.r = 5; m.life = 4;
+  }
+  function useFlare(){                  // countermeasure: decoy every incoming missile
+    if (flares <= 0 || flareTimer > 0) return;
+    flares--; flareTimer = TUNE.flareCooldown;
+    for (var i = 0; i < missiles.length; i++){
+      if (!missiles[i].dead){ explode(missiles[i].x, missiles[i].y, TUNE.spark, 5); missiles[i].dead = true; }
+    }
+    for (var j = 0; j < 12; j++){        // flare burst behind you
+      var p = acquire(particles); p.dead = false;
+      var a = rand(0, Math.PI*2), sp = rand(60, 190);
+      p.x = player.x; p.y = player.y + 8; p.vx = Math.cos(a)*sp; p.vy = Math.sin(a)*sp + 90;
+      p.life = p.max = rand(0.4, 0.85); p.size = rand(2, 4); p.color = TUNE.spark;
+    }
+    shake = Math.max(shake, 3);
+  }
+
+
+  // ===== GAME FLOW =====================================================
+  function startGame(){
+    state = "play";
+    score = 0; elapsed = 0; spawnCursor = 0; hitFlash = 0;
+    player.x = W / 2; player.y = H * 0.82; player.hp = TUNE.playerHP;  // on the deck at launch
+    target.x = player.x; target.y = player.y;
+    fireTimer = 0; dragging = false; activeId = null;
+    bombs = TUNE.startBombs; shake = 0; hitStop = 0;
+    bullets.length = 0; enemyBullets.length = 0; enemies.length = 0; particles.length = 0;
+    rings.length = 0; trails.length = 0; missiles.length = 0; playerMissiles.length = 0;
+    a2aAmmo = TUNE.a2aAmmo; a2aTimer = 0; flares = TUNE.flareCharges; flareTimer = 0;
+    boss = null; bossSpawned = false;
+    canyonScroll = 0; canyonDist = 0; obstacles.length = 0; obstacleTimer = 0;
+    phase = 'launch'; launchTimer = TUNE.launchTime; combatTime = 0; landHold = 0;  // start on the catapult
+    commCursor = 0; radioTimer = 0;
+    seedTerrain();
+    menuEl.classList.add("hidden");
+    resultsEl.classList.add("hidden");
+  }
+  function endGame(won){                 // debrief + medal rating (build 7)
+    state = "results";
+    var medal = "";
+    if (won){
+      var hpFrac = player.hp / TUNE.playerHP;
+      medal = (hpFrac > 0.85 && landHold >= 1) ? "ACE" : hpFrac > 0.6 ? "GOLD" : hpFrac > 0.3 ? "SILVER" : "BRONZE";
+    }
+    resTitle.textContent = won ? "Sector Clear" : "Shot Down";
+    resKicker.textContent = won ? ("MEDAL — " + medal) : "★ Aircraft lost";
+    resScore.textContent = "SCORE " + score;
+    resultsEl.classList.remove("hidden");
+  }
+
+
+  // ===== MINIBOSS: alien laser/shield node (build 5) ===================
+  function spawnBoss(){
+    boss = {
+      x: W/2, y: -90, targetY: H * 0.24, r: 46,
+      coreHp: TUNE.bossCoreHp, coreMax: TUNE.bossCoreHp,
+      shieldHp: TUNE.bossShieldHp, shieldMax: TUNE.bossShieldHp,
+      laserAngle: 0, fireTimer: 2.0, entering: true
+    };
+  }
+  function bleedPlayer(dmg){            // continuous damage — light flash, no per-frame explosions
+    player.hp -= dmg;
+    hitFlash = Math.max(hitFlash, 0.06); flashColor = "232,65,47";
+    if (player.hp <= 0){ player.hp = 0; kaboom(player.x, player.y, true); endGame(false); }
+  }
+  function pointNearRay(px, py, ox, oy, ang, halfW){   // is a point within a beam from (ox,oy)?
+    var dx = px - ox, dy = py - oy;
+    var along = dx * Math.cos(ang) + dy * Math.sin(ang);
+    if (along < 0 || along > Math.max(W, H)) return false;
+    var perp = -dx * Math.sin(ang) + dy * Math.cos(ang);
+    return Math.abs(perp) < halfW;
+  }
+  function bossFire(b){                 // aimed shot at the player
+    var bl = acquire(enemyBullets);
+    bl.dead = false; bl.x = b.x; bl.y = b.y;
+    var dx = player.x - b.x, dy = player.y - b.y, d = Math.hypot(dx, dy) || 1;
+    bl.vx = dx/d * TUNE.enemyBulletSpeed; bl.vy = dy/d * TUNE.enemyBulletSpeed; bl.r = 6;
+  }
+  function updateBoss(dt){
+    var b = boss; if (!b) return;
+    if (b.entering){
+      b.y += 70 * dt;
+      if (b.y >= b.targetY){ b.y = b.targetY; b.entering = false; }
+      return;
+    }
+    b.x = W/2 + Math.sin(elapsed * 0.5) * (W * 0.22);   // slow drift
+    b.laserAngle += TUNE.bossLaserRate * dt;
+    b.fireTimer -= dt;
+    if (b.fireTimer <= 0){ bossFire(b); b.fireTimer = TUNE.bossFireEvery; }
+    // two opposing rotating beams
+    for (var k = 0; k < 2; k++){
+      if (pointNearRay(player.x, player.y, b.x, b.y, b.laserAngle + k*Math.PI, TUNE.bossLaserWidth)){
+        bleedPlayer(TUNE.bossLaserDmg * dt); if (state !== "play") return;
+      }
+    }
+    // touching the core body hurts
+    var cdx = b.x - player.x, cdy = b.y - player.y;
+    if (cdx*cdx + cdy*cdy < (b.r + TUNE.playerRadius)*(b.r + TUNE.playerRadius)){
+      bleedPlayer(TUNE.bossContactDmg * dt); if (state !== "play") return;
+    }
+  }
+  function genPos(){ return { x: boss.x, y: boss.y + 34, r: 15 }; }  // shield-generator pod
+  function hitBoss(proj, dmg){          // route a player projectile into the boss
+    var b = boss; if (!b) return;       // boss may have died earlier this frame
+    if (b.shieldHp > 0){
+      var g = genPos(), gdx = proj.x - g.x, gdy = proj.y - g.y;
+      if (gdx*gdx + gdy*gdy < (proj.r + g.r)*(proj.r + g.r)){    // hit the pod → damage shield
+        proj.dead = true; b.shieldHp -= dmg; explode(proj.x, proj.y, TUNE.fire, 4);
+        if (b.shieldHp <= 0){ b.shieldHp = 0; spawnRing(b.x, b.y, TUNE.spark, 130); shake = Math.max(shake, 12); }
+        return;
+      }
+      var sdx = proj.x - b.x, sdy = proj.y - b.y;               // hit the shielded core → deflect
+      if (sdx*sdx + sdy*sdy < (proj.r + b.r)*(proj.r + b.r)){ proj.dead = true; explode(proj.x, proj.y, TUNE.spark, 2); }
+    } else {
+      var kdx = proj.x - b.x, kdy = proj.y - b.y;               // shield down → damage the core
+      if (kdx*kdx + kdy*kdy < (proj.r + b.r)*(proj.r + b.r)){
+        proj.dead = true; b.coreHp -= dmg; explode(proj.x, proj.y, TUNE.fire, 4);
+        if (b.coreHp <= 0){ b.coreHp = 0; defeatBoss(); }
+      }
+    }
+  }
+  function defeatBoss(){
+    if (!boss) return;
+    for (var i = 0; i < 6; i++) spawnRing(boss.x + rand(-30,30), boss.y + rand(-30,30), TUNE.fire, rand(60,150));
+    kaboom(boss.x, boss.y, true); explode(boss.x, boss.y, TUNE.fire, 40);
+    shake = Math.max(shake, 26); score += 500;
+    boss = null;
+    startCanyon();   // B6: boss death → canyon-run escape (B7 routes to landing after)
+  }
+
+  // ===== CANYON-RUN ESCAPE (build 6) ===================================
+  function startCanyon(){
+    phase = 'canyon';
+    canyonScroll = 0; canyonDist = 0; obstacles.length = 0; obstacleTimer = 0.5;
+    enemyBullets.length = 0; missiles.length = 0;   // clear leftover fire
+  }
+  function endCanyon(){ startLanding(); }   // break out to sea → recovery landing (build 7)
+  // -- launch / landing bookends (build 7) --
+  function updateLaunch(dt){
+    launchTimer -= dt;
+    var t = 1 - launchTimer / TUNE.launchTime;         // 0→1 through the launch
+    player.y -= (30 + 90 * t) * dt;                    // accelerate up the deck
+    player.y = clamp(player.y, H * 0.62, H);
+    emitTrail(player.x, player.y + 14, TUNE.player, 7);
+    decayFx(dt);
+    if (launchTimer <= 0){ phase = 'combat'; combatTime = 0; player.y = H * 0.72; target.x = player.x; target.y = player.y; }
+  }
+  function startLanding(){
+    phase = 'landing'; landHold = 0; player.y = H * 0.44; target.x = player.x; target.y = player.y;
+    enemyBullets.length = 0; missiles.length = 0;
+  }
+  function updateLanding(dt){
+    player.x += (target.x - player.x) * TUNE.playerFollow;
+    player.y += (target.y - player.y) * TUNE.playerFollow;
+    player.x = clamp(player.x, 20, W - 20); player.y = clamp(player.y, 60, H - 30);
+    var inZone = Math.abs(player.x - W/2) < W*0.12 && player.y > H*0.66;   // the corridor box
+    landHold += (inZone ? dt / TUNE.landHoldTime : -dt * 0.6);
+    landHold = clamp(landHold, 0, 1);
+    emitTrail(player.x, player.y + 14, TUNE.player, 6);
+    decayFx(dt);
+    if (landHold >= 1){ explode(player.x, player.y, TUNE.spark, 12); spawnRing(player.x, player.y, TUNE.spark, 80); endGame(true); }
+  }
+  function decayFx(dt){                                // shared particle/ring/trail/flash decay
+    for (var p = 0; p < particles.length; p++){ var pt = particles[p]; if (pt.dead) continue; pt.x += pt.vx*dt; pt.y += pt.vy*dt; pt.vx *= 0.92; pt.vy *= 0.92; pt.life -= dt; if (pt.life <= 0) pt.dead = true; }
+    for (var r = 0; r < rings.length; r++){ var rg = rings[r]; if (rg.dead) continue; rg.r += (rg.maxR - rg.r) * Math.min(1, dt*8); rg.life -= dt; if (rg.life <= 0) rg.dead = true; }
+    for (var i = 0; i < trails.length; i++){ var tt = trails[i]; if (tt.dead) continue; tt.life -= dt; if (tt.life <= 0) tt.dead = true; }
+    if (shake > 0) shake = Math.max(0, shake - 60*dt);
+    if (hitFlash > 0) hitFlash -= dt;
+  }
+  function laneAt(screenY){            // safe-lane bounds at a screen row (meanders + narrows)
+    var worldY = screenY + canyonScroll;
+    var center = W/2 + Math.sin(worldY * 0.006) * (W * 0.16);
+    var t = clamp(canyonDist / TUNE.canyonLength, 0, 1);
+    var half = (0.40 - 0.24 * t) * W;    // 0.40W → 0.16W as you go deeper
+    return { left: center - half, right: center + half, center: center, half: half };
+  }
+  function spawnObstacle(){
+    var lane = laneAt(-40);
+    var o = acquire(obstacles);
+    o.dead = false; o.x = rand(lane.left + 34, lane.right - 34); o.y = -40; o.r = rand(15, 26);
+  }
+  function updateCanyon(dt){
+    canyonScroll += TUNE.canyonSpeed * dt; canyonDist += TUNE.canyonSpeed * dt;
+    // fly (same drag-follow)
+    player.x += (target.x - player.x) * TUNE.playerFollow;
+    player.y += (target.y - player.y) * TUNE.playerFollow;
+    player.y = clamp(player.y, 60, H - 40);
+    // obstacles scroll down + collide
+    obstacleTimer -= dt;
+    if (obstacleTimer <= 0){ spawnObstacle(); obstacleTimer = TUNE.obstacleEvery; }
+    for (var i = 0; i < obstacles.length; i++){
+      var o = obstacles[i]; if (o.dead) continue;
+      o.y += TUNE.canyonSpeed * dt;
+      if (o.y > H + 40){ o.dead = true; continue; }
+      var dx = o.x - player.x, dy = o.y - player.y, rr = o.r + TUNE.playerRadius;
+      if (dx*dx + dy*dy < rr*rr){ o.dead = true; explode(o.x, o.y, TUNE.rockEdge, 8); shake = Math.max(shake,8); bleedPlayer(30); if (state !== "play") return; }
+    }
+    // scrape a wall → clamp back + damage
+    var lane = laneAt(player.y), m = TUNE.playerRadius + 6;
+    if (player.x < lane.left + m){ player.x = lane.left + m; bleedPlayer(TUNE.canyonWallDmg * dt); if (state !== "play") return; }
+    if (player.x > lane.right - m){ player.x = lane.right - m; bleedPlayer(TUNE.canyonWallDmg * dt); if (state !== "play") return; }
+    player.x = clamp(player.x, 20, W - 20);
+    // shared juice
+    for (var p = 0; p < particles.length; p++){ var pt = particles[p]; if (pt.dead) continue; pt.x += pt.vx*dt; pt.y += pt.vy*dt; pt.vx *= 0.92; pt.vy *= 0.92; pt.life -= dt; if (pt.life <= 0) pt.dead = true; }
+    for (var ri = 0; ri < rings.length; ri++){ var rg = rings[ri]; if (rg.dead) continue; rg.r += (rg.maxR - rg.r) * Math.min(1, dt*8); rg.life -= dt; if (rg.life <= 0) rg.dead = true; }
+    for (var ti = 0; ti < trails.length; ti++){ var tt = trails[ti]; if (tt.dead) continue; tt.life -= dt; if (tt.life <= 0) tt.dead = true; }
+    emitTrail(player.x, player.y + 14, TUNE.player, 6);
+    if (shake > 0) shake = Math.max(0, shake - 60 * dt);
+    if (hitFlash > 0) hitFlash -= dt;
+    if (canyonDist >= TUNE.canyonLength) endCanyon();
+  }
+
+
+  // ===== UPDATE ========================================================
+  function update(dt){
+    elapsed += dt;
+    if (phase === 'launch'){ updateLaunch(dt); return; }
+    if (phase === 'canyon'){ updateCanyon(dt); return; }
+    if (phase === 'landing'){ updateLanding(dt); return; }
+    combatTime += dt;
+    scrollY += TUNE.scrollSpeed * dt;
+    if (hitFlash > 0) hitFlash -= dt;
+
+    // scroll terrain, recycle when it drifts off the bottom
+    for (var i = 0; i < islands.length; i++){
+      var is = islands[i];
+      is.y += TUNE.scrollSpeed * dt;
+      if (is.y - is.h > H){ is.y = -is.h - rand(0, H*0.5); is.x = rand(0.1, 0.9); is.w = rand(90,190); is.h = rand(120,240); }
+    }
+    for (var s = 0; s < specks.length; s++){
+      var sp = specks[s];
+      sp.y += TUNE.scrollSpeed * 0.6 * dt; // parallax: background flecks scroll slower
+      if (sp.y > H){ sp.y = -4; sp.x = rand(0, 1); }
+    }
+
+    // spawn from the data-driven timeline
+    while (spawnCursor < TUNE.level.length && TUNE.level[spawnCursor].t <= combatTime){
+      spawnEnemy(TUNE.level[spawnCursor].x, TUNE.level[spawnCursor].type);
+      spawnCursor++;
+    }
+    // radio comms + mid-mission complication (build 8)
+    while (commCursor < COMMS.length && COMMS[commCursor].t <= combatTime){
+      var cm = COMMS[commCursor];
+      radioText = cm.x; radioSpeaker = cm.s; radioTimer = 4.5;
+      if (cm.reinforce){ for (var rc = 0; rc < 3; rc++) spawnEnemy(0.22 + rc*0.28, 'fighter'); }
+      commCursor++;
+    }
+    if (radioTimer > 0) radioTimer -= dt;
+
+    // player chases finger (offset above), clamped on-screen
+    player.x += (target.x - player.x) * TUNE.playerFollow;
+    player.y += (target.y - player.y) * TUNE.playerFollow;
+    player.x = clamp(player.x, 24, W - 24);
+    player.y = clamp(player.y, 60, H - 40);
+
+    // auto-fire
+    fireTimer -= dt;
+    if (fireTimer <= 0){ firePlayer(); fireTimer = TUNE.fireInterval; }
+
+    // your bullets
+    for (var b = 0; b < bullets.length; b++){
+      var pb = bullets[b]; if (pb.dead) continue;
+      pb.y += pb.vy * dt;
+      if (pb.y < -20) pb.dead = true;
+    }
+    // enemy bullets (now support horizontal velocity for aimed shots)
+    for (var eb = 0; eb < enemyBullets.length; eb++){
+      var ebu = enemyBullets[eb]; if (ebu.dead) continue;
+      ebu.x += (ebu.vx || 0) * dt; ebu.y += ebu.vy * dt;
+      if (ebu.y > H + 20 || ebu.y < -20 || ebu.x < -20 || ebu.x > W + 20) ebu.dead = true;
+    }
+    // tracked homing missiles (build 3) — turn toward the player at a capped rate
+    for (var mi = 0; mi < missiles.length; mi++){
+      var m = missiles[mi]; if (m.dead) continue;
+      var desired = Math.atan2(player.y - m.y, player.x - m.x);
+      var da = desired - m.ang;
+      while (da > Math.PI) da -= Math.PI * 2;
+      while (da < -Math.PI) da += Math.PI * 2;
+      var maxTurn = TUNE.missileTurn * dt;
+      m.ang += clamp(da, -maxTurn, maxTurn);
+      m.x += Math.cos(m.ang) * TUNE.missileSpeed * dt;
+      m.y += Math.sin(m.ang) * TUNE.missileSpeed * dt;
+      emitTrail(m.x, m.y, TUNE.enemyShot, 4);           // smoke trail
+      m.life -= dt;
+      if (m.life <= 0 || m.x < -40 || m.x > W + 40 || m.y > H + 40 || m.y < -40) m.dead = true;
+    }
+    // your heat-seekers (build 4) — home toward the locked air target
+    if (a2aTimer > 0) a2aTimer -= dt;
+    if (flareTimer > 0) flareTimer -= dt;
+    for (var pm = 0; pm < playerMissiles.length; pm++){
+      var ym = playerMissiles[pm]; if (ym.dead) continue;
+      if (!ym.target || ym.target.dead) ym.target = nearestAir(ym.x, ym.y);   // retarget if lost
+      if (ym.target && !ym.target.dead){
+        var des = Math.atan2(ym.target.y - ym.y, ym.target.x - ym.x);
+        var da2 = des - ym.ang; while (da2 > Math.PI) da2 -= Math.PI*2; while (da2 < -Math.PI) da2 += Math.PI*2;
+        var mt = TUNE.a2aTurn * dt; ym.ang += clamp(da2, -mt, mt);
+      }
+      ym.x += Math.cos(ym.ang) * TUNE.a2aSpeed * dt;
+      ym.y += Math.sin(ym.ang) * TUNE.a2aSpeed * dt;
+      emitTrail(ym.x, ym.y, TUNE.playerShot, 3);
+      ym.life -= dt;
+      if (ym.life <= 0 || ym.y < -30 || ym.x < -30 || ym.x > W + 30) ym.dead = true;
+    }
+
+    // enemies: move + fire (per type)
+    for (var e = 0; e < enemies.length; e++){
+      var en = enemies[e]; if (en.dead) continue;
+      if (en.ground){                                   // tank / SAM ride the terrain
+        en.y += TUNE.scrollSpeed * dt; en.x = en.baseX;
+      } else if (en.type === 'heli'){                   // helicopter — slow, wide weave
+        en.y += TUNE.heliSpeed * dt;
+        en.x = en.baseX + Math.sin(elapsed * 1.1 + en.phase) * (TUNE.enemySway * 1.4);
+      } else {                                          // fighter
+        en.y += TUNE.enemySpeed * dt;
+        en.x = en.baseX + Math.sin(elapsed * 1.5 + en.phase) * TUNE.enemySway;
+      }
+      en.fire -= dt;
+      if (en.fire <= 0 && en.y > 0 && en.y < H * 0.8){
+        if (en.type === 'sam')       { fireMissile(en);    en.fire = TUNE.samFireEvery; }
+        else if (en.type === 'heli') { fireEnemyAimed(en); en.fire = TUNE.heliFireEvery; }
+        else if (en.type === 'tank') { fireEnemy(en);      en.fire = TUNE.tankFireEvery; }
+        else                         { fireEnemy(en);      en.fire = TUNE.enemyFireEvery; }
+      }
+      if (en.y > H + 40) en.dead = true; // escaped off the bottom
+    }
+
+    // particles
+    for (var p = 0; p < particles.length; p++){
+      var pt = particles[p]; if (pt.dead) continue;
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt;
+      pt.vx *= 0.92; pt.vy *= 0.92;
+      pt.life -= dt;
+      if (pt.life <= 0) pt.dead = true;
+    }
+
+    // shockwave rings (build 2)
+    for (var ri = 0; ri < rings.length; ri++){
+      var rg = rings[ri]; if (rg.dead) continue;
+      rg.r += (rg.maxR - rg.r) * Math.min(1, dt * 8);
+      rg.life -= dt;
+      if (rg.life <= 0) rg.dead = true;
+    }
+    // engine trails fade (build 2)
+    for (var ti = 0; ti < trails.length; ti++){
+      var tt = trails[ti]; if (tt.dead) continue;
+      tt.life -= dt;
+      if (tt.life <= 0) tt.dead = true;
+    }
+    // emit a fresh trail puff behind the player + each enemy
+    emitTrail(player.x, player.y + 14, TUNE.player, 6);
+    for (var te = 0; te < enemies.length; te++){ var ete = enemies[te]; if (!ete.dead && !ete.ground) emitTrail(ete.x, ete.y - 12, TUNE.enemy, 5); }
+    // screen-shake decays back to zero
+    if (shake > 0) shake = Math.max(0, shake - 60 * dt);
+
+    updateBoss(dt);
+    collisions();
+
+    // timeline done + sky clear → summon the miniboss (build 5); win only when it dies
+    if (state === "play" && spawnCursor >= TUNE.level.length && !bossSpawned){
+      var anyAlive = false;
+      for (var k = 0; k < enemies.length; k++){ if (!enemies[k].dead){ anyAlive = true; break; } }
+      if (!anyAlive){ spawnBoss(); bossSpawned = true; }
+    }
+  }
+
+  function hitPlayer(dmg){
+    player.hp -= dmg;
+    hitFlash = 0.12; flashColor = "232,65,47";   // red — you took damage
+    shake = Math.max(shake, TUNE.shakeOnHit);
+    explode(player.x, player.y, TUNE.spark, 6);
+    if (player.hp <= 0){ player.hp = 0; kaboom(player.x, player.y, true); endGame(false); }
+  }
+
+  function collisions(){
+    // your bullets vs enemies
+    for (var b = 0; b < bullets.length; b++){
+      var pb = bullets[b]; if (pb.dead) continue;
+      for (var e = 0; e < enemies.length; e++){
+        var en = enemies[e]; if (en.dead) continue;
+        var dx = pb.x - en.x, dy = pb.y - en.y;
+        if (dx*dx + dy*dy < (pb.r + en.r) * (pb.r + en.r)){
+          pb.dead = true;
+          en.hp -= TUNE.playerBulletDamage;
+          explode(pb.x, pb.y, TUNE.spark, 3);
+          if (en.hp <= 0){
+            en.dead = true;
+            score += TUNE.scorePerKill;
+            kaboom(en.x, en.y, false);
+          }
+          break;
+        }
+      }
+    }
+    // your heat-seekers vs enemies (build 4)
+    for (var ym2 = 0; ym2 < playerMissiles.length; ym2++){
+      var yq = playerMissiles[ym2]; if (yq.dead) continue;
+      for (var e3 = 0; e3 < enemies.length; e3++){
+        var en3 = enemies[e3]; if (en3.dead) continue;
+        var qdx = yq.x - en3.x, qdy = yq.y - en3.y;
+        if (qdx*qdx + qdy*qdy < (yq.r + en3.r) * (yq.r + en3.r)){
+          yq.dead = true; en3.hp -= TUNE.a2aDamage; explode(yq.x, yq.y, TUNE.fire, 6);
+          if (en3.hp <= 0){ en3.dead = true; score += TUNE.scorePerKill; kaboom(en3.x, en3.y, false); }
+          break;
+        }
+      }
+    }
+    // your weapons vs the miniboss (build 5)
+    if (boss && !boss.entering){
+      for (var bi = 0; bi < bullets.length; bi++){ var pbb = bullets[bi]; if (!pbb.dead) hitBoss(pbb, TUNE.playerBulletDamage); }
+      for (var mi3 = 0; mi3 < playerMissiles.length; mi3++){ var pmb = playerMissiles[mi3]; if (!pmb.dead) hitBoss(pmb, TUNE.a2aDamage); }
+    }
+    // your bullets vs incoming missiles — you can shoot them down
+    for (var b2 = 0; b2 < bullets.length; b2++){
+      var pb2 = bullets[b2]; if (pb2.dead) continue;
+      for (var m2 = 0; m2 < missiles.length; m2++){
+        var mm = missiles[m2]; if (mm.dead) continue;
+        var mdx = pb2.x - mm.x, mdy = pb2.y - mm.y;
+        if (mdx*mdx + mdy*mdy < (pb2.r + mm.r) * (pb2.r + mm.r)){
+          pb2.dead = true; mm.dead = true; explode(mm.x, mm.y, TUNE.fire, 6); break;
+        }
+      }
+    }
+    // enemy bullets vs you
+    for (var eb = 0; eb < enemyBullets.length; eb++){
+      var ebu = enemyBullets[eb]; if (ebu.dead) continue;
+      var dxp = ebu.x - player.x, dyp = ebu.y - player.y;
+      var rr = ebu.r + TUNE.playerRadius;
+      if (dxp*dxp + dyp*dyp < rr*rr){ ebu.dead = true; hitPlayer(TUNE.enemyBulletDamage); if (state!=="play") return; }
+    }
+    // missiles vs you
+    for (var mp = 0; mp < missiles.length; mp++){
+      var mv = missiles[mp]; if (mv.dead) continue;
+      var mpx = mv.x - player.x, mpy = mv.y - player.y;
+      var mpr = mv.r + TUNE.playerRadius;
+      if (mpx*mpx + mpy*mpy < mpr*mpr){ mv.dead = true; explode(mv.x, mv.y, TUNE.fire, 10); hitPlayer(TUNE.missileDamage); if (state !== "play") return; }
+    }
+    // enemies crashing into you
+    for (var en2i = 0; en2i < enemies.length; en2i++){
+      var en2 = enemies[en2i]; if (en2.dead) continue;
+      var cdx = en2.x - player.x, cdy = en2.y - player.y;
+      var cr = en2.r + TUNE.playerRadius;
+      if (cdx*cdx + cdy*cdy < cr*cr){
+        en2.dead = true;
+        kaboom(en2.x, en2.y, false);
+        hitPlayer(TUNE.contactDamage);
+        if (state !== "play") return;
+      }
+    }
+  }
+
+
+  // ===== DRAW ==========================================================
+  function drawTerrain(){
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, TUNE.seaTop);
+    g.addColorStop(1, TUNE.seaBottom);
+    ctx.fillStyle = g;
+    ctx.fillRect(-24, -24, W + 48, H + 48);  // overfill so screen-shake never reveals an edge
+
+    // faint parallax flecks
+    ctx.fillStyle = TUNE.speck;
+    for (var s = 0; s < specks.length; s++){
+      var sp = specks[s];
+      ctx.fillRect(sp.x * W, sp.y, sp.s, sp.s);
+    }
+
+    // muted landmasses with a sandy rim + darker contour (cartographic feel)
+    for (var i = 0; i < islands.length; i++){
+      var is = islands[i];
+      var x = is.x * W - is.w/2, y = is.y;
+      ctx.fillStyle = TUNE.sand;
+      roundRect(x - is.sand, y - is.sand, is.w + is.sand*2, is.h + is.sand*2, 40); ctx.fill();
+      ctx.fillStyle = TUNE.land;
+      roundRect(x, y, is.w, is.h, 34); ctx.fill();
+      ctx.strokeStyle = TUNE.landEdge; ctx.lineWidth = 2;
+      roundRect(x + 14, y + 18, is.w - 28, is.h - 36, 24); ctx.stroke();
+    }
+  }
+
+  function drawPlayer(){
+    if (player.hp <= 0) return;
+    var x = player.x, y = player.y;
+    // additive engine glow
+    ctx.globalCompositeOperation = "lighter";
+    blitGlow(glowPlayer, x, y + 12, 1.1);
+    ctx.globalCompositeOperation = "source-over";
+    // amber delta (placeholder — real art later)
+    ctx.fillStyle = TUNE.player;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 20);
+    ctx.lineTo(x - 15, y + 12);
+    ctx.lineTo(x, y + 4);
+    ctx.lineTo(x + 15, y + 12);
+    ctx.closePath(); ctx.fill();
+    // cockpit highlight
+    ctx.fillStyle = TUNE.playerHi;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 14); ctx.lineTo(x - 4, y - 2); ctx.lineTo(x + 4, y - 2);
+    ctx.closePath(); ctx.fill();
+  }
+
+  function drawEnemy(en){        // dispatch by type (placeholder silhouettes — real art later)
+    if (en.type === 'heli') { drawHeli(en); return; }
+    if (en.type === 'tank') { drawTank(en); return; }
+    if (en.type === 'sam')  { drawSam(en);  return; }
+    drawFighter(en);
+  }
+  function drawFighter(en){     // gunmetal delta, pointing DOWN
+    var x = en.x, y = en.y;
+    ctx.fillStyle = TUNE.enemy;
+    ctx.beginPath();
+    ctx.moveTo(x, y + 18); ctx.lineTo(x - 14, y - 11); ctx.lineTo(x, y - 4); ctx.lineTo(x + 14, y - 11);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = TUNE.enemyEdge; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.fillStyle = TUNE.star; star(x, y - 2, 4);
+  }
+  function drawHeli(en){        // fuselage + spinning rotor (air)
+    var x = en.x, y = en.y;
+    ctx.fillStyle = TUNE.enemy;
+    roundRect(x - 8, y - 14, 16, 30, 7); ctx.fill();
+    ctx.strokeStyle = TUNE.enemyEdge; ctx.lineWidth = 1.5; roundRect(x - 8, y - 14, 16, 30, 7); ctx.stroke();
+    ctx.fillStyle = TUNE.enemyEdge; ctx.fillRect(x - 2, y + 12, 4, 8);            // tail
+    var rot = elapsed * 22 + en.phase;                                            // rotor blur
+    ctx.strokeStyle = "rgba(200,210,220,0.45)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x + Math.cos(rot)*22, y + Math.sin(rot)*22); ctx.lineTo(x - Math.cos(rot)*22, y - Math.sin(rot)*22); ctx.stroke();
+    ctx.fillStyle = TUNE.star; star(x, y, 3);
+  }
+  function drawTank(en){        // boxy hull + turret + raised barrel (ground)
+    var x = en.x, y = en.y;
+    ctx.fillStyle = TUNE.enemyEdge; ctx.fillRect(x - 4, y - 26, 8, 18);           // barrel up
+    ctx.fillStyle = TUNE.enemy; roundRect(x - 16, y - 12, 32, 24, 4); ctx.fill();  // hull
+    ctx.strokeStyle = TUNE.enemyEdge; ctx.lineWidth = 1.5; roundRect(x - 16, y - 12, 32, 24, 4); ctx.stroke();
+    ctx.fillStyle = TUNE.enemy; roundRect(x - 9, y - 9, 18, 18, 3); ctx.fill();    // turret
+    ctx.strokeStyle = TUNE.enemyEdge; roundRect(x - 9, y - 9, 18, 18, 3); ctx.stroke();
+    ctx.fillStyle = TUNE.star; star(x, y, 3.5);
+  }
+  function drawSam(en){         // launch vehicle + raised rails (ground)
+    var x = en.x, y = en.y;
+    ctx.strokeStyle = "#8a939c"; ctx.lineWidth = 3;                                // raised launch rails
+    for (var i = -1; i <= 1; i++){ ctx.beginPath(); ctx.moveTo(x + i*7, y + 2); ctx.lineTo(x + i*7 - 5, y - 18); ctx.stroke(); }
+    ctx.fillStyle = TUNE.enemy; roundRect(x - 15, y - 10, 30, 22, 4); ctx.fill();  // vehicle
+    ctx.strokeStyle = TUNE.enemyEdge; ctx.lineWidth = 1.5; roundRect(x - 15, y - 10, 30, 22, 4); ctx.stroke();
+    ctx.fillStyle = TUNE.star; star(x, y + 4, 3.5);
+  }
+  function drawMissiles(){      // tracked homing missiles, oriented by heading
+    ctx.globalCompositeOperation = "lighter";
+    for (var i = 0; i < missiles.length; i++){
+      var m = missiles[i]; if (m.dead) continue;
+      blitGlow(glowEnemy, m.x, m.y, 0.9);
+      ctx.save(); ctx.translate(m.x, m.y); ctx.rotate(m.ang);
+      ctx.fillStyle = TUNE.enemyShot;
+      ctx.beginPath(); ctx.moveTo(9, 0); ctx.lineTo(-5, -3.5); ctx.lineTo(-5, 3.5); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    ctx.globalCompositeOperation = "source-over";
+  }
+  function drawPlayerMissiles(){  // your heat-seekers (amber, oriented by heading)
+    ctx.globalCompositeOperation = "lighter";
+    for (var i = 0; i < playerMissiles.length; i++){
+      var m = playerMissiles[i]; if (m.dead) continue;
+      blitGlow(glowPlayer, m.x, m.y, 0.8);
+      ctx.save(); ctx.translate(m.x, m.y); ctx.rotate(m.ang);
+      ctx.fillStyle = TUNE.playerShot;
+      ctx.beginPath(); ctx.moveTo(9, 0); ctx.lineTo(-5, -3); ctx.lineTo(-5, 3); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    ctx.globalCompositeOperation = "source-over";
+  }
+  function drawBoss(){          // alien laser/shield node (build 5)
+    var b = boss; if (!b) return;
+    // rotating laser beams (after entrance)
+    if (!b.entering){
+      ctx.globalCompositeOperation = "lighter";
+      for (var k = 0; k < 2; k++){
+        var ang = b.laserAngle + k * Math.PI;
+        var ex = b.x + Math.cos(ang) * Math.max(W, H), ey = b.y + Math.sin(ang) * Math.max(W, H);
+        ctx.strokeStyle = TUNE.enemyShot; ctx.globalAlpha = 0.30; ctx.lineWidth = TUNE.bossLaserWidth;
+        ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(ex, ey); ctx.stroke();
+        ctx.strokeStyle = "#ffffff"; ctx.globalAlpha = 0.85; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(ex, ey); ctx.stroke();
+      }
+      ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+    }
+    // gunmetal hex core
+    ctx.fillStyle = TUNE.enemy; ctx.beginPath();
+    for (var i = 0; i < 6; i++){ var a = i*Math.PI/3 + Math.PI/6; var px = b.x + Math.cos(a)*b.r, py = b.y + Math.sin(a)*b.r; if (i===0) ctx.moveTo(px, py); else ctx.lineTo(px, py); }
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = TUNE.enemyEdge; ctx.lineWidth = 2; ctx.stroke();
+    if (b.shieldHp > 0){
+      ctx.strokeStyle = "rgba(88,229,255,0.6)"; ctx.lineWidth = 3;   // shield ring
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r + 10 + Math.sin(elapsed*4)*2, 0, Math.PI*2); ctx.stroke();
+      var g = genPos();                                              // generator pod (target this!)
+      ctx.fillStyle = "#58e5ff"; ctx.beginPath(); ctx.arc(g.x, g.y, g.r, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = "#bffcff"; ctx.lineWidth = 2; ctx.stroke();
+    } else {
+      ctx.globalCompositeOperation = "lighter"; blitGlow(glowSpark, b.x, b.y, 1.7); ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = TUNE.fire; ctx.beginPath(); ctx.arc(b.x, b.y, 14 + Math.sin(elapsed*8)*3, 0, Math.PI*2); ctx.fill();  // exposed core
+    }
+    ctx.fillStyle = TUNE.star; star(b.x, b.y - b.r + 8, 5);
+  }
+  function drawBossBar(){
+    var b = boss; if (!b || b.entering) return;
+    var bw = W * 0.72, bx = (W - bw)/2, by = 56, bh = 9;
+    var shielded = b.shieldHp > 0;
+    hudText(shielded ? "SHIELD GENERATOR" : "CORE — EXPOSED", W/2, by - 16, 10, shielded ? "#58e5ff" : TUNE.warnRed, "center");
+    ctx.strokeStyle = TUNE.hudDim; ctx.lineWidth = 1.5; ctx.strokeRect(bx, by, bw, bh);
+    var frac = shielded ? (b.shieldHp / b.shieldMax) : (b.coreHp / b.coreMax);
+    ctx.fillStyle = shielded ? "#58e5ff" : TUNE.warnRed;
+    ctx.fillRect(bx + 1, by + 1, (bw - 2) * clamp(frac, 0, 1), bh - 2);
+  }
+  function drawCanyonScene(){   // build 6 — the escape run
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#141a12"); g.addColorStop(1, "#1c2416");
+    ctx.fillStyle = g; ctx.fillRect(-24, -24, W + 48, H + 48);
+    // rock walls (sample the lane down the screen)
+    ctx.fillStyle = TUNE.rockColor;
+    ctx.beginPath(); ctx.moveTo(-24, -24);
+    for (var y = -20; y <= H + 20; y += 18){ ctx.lineTo(laneAt(y).left, y); }
+    ctx.lineTo(-24, H + 24); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(W + 24, -24);
+    for (var y2 = -20; y2 <= H + 20; y2 += 18){ ctx.lineTo(laneAt(y2).right, y2); }
+    ctx.lineTo(W + 24, H + 24); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = TUNE.rockEdge; ctx.lineWidth = 3;
+    ctx.beginPath(); for (var y3 = -20; y3 <= H + 20; y3 += 18){ var l3 = laneAt(y3); if (y3 < 0) ctx.moveTo(l3.left, y3); else ctx.lineTo(l3.left, y3); } ctx.stroke();
+    ctx.beginPath(); for (var y4 = -20; y4 <= H + 20; y4 += 18){ var l4 = laneAt(y4); if (y4 < 0) ctx.moveTo(l4.right, y4); else ctx.lineTo(l4.right, y4); } ctx.stroke();
+    // speed streaks (sense of velocity)
+    ctx.globalAlpha = 0.12; ctx.strokeStyle = "#dfe8ec"; ctx.lineWidth = 2;
+    for (var s = 0; s < 8; s++){ var sx = 40 + s*(W-80)/7; var sy = ((s*211 + canyonScroll) % (H + 60)) - 30; ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx, sy + 34); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+    // rock spires
+    for (var i = 0; i < obstacles.length; i++){ var o = obstacles[i]; if (o.dead) continue;
+      ctx.fillStyle = TUNE.rockColor; ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = TUNE.rockEdge; ctx.lineWidth = 2; ctx.stroke();
+    }
+    drawTrails(); drawPlayer(); drawParticles(); drawRings();
+  }
+  function drawCanyonHud(){
+    var pulse = 0.5 + 0.5 * Math.sin(elapsed * 8);
+    ctx.globalAlpha = 0.6 + 0.4 * pulse;
+    hudText("ESCAPE — PULL UP", W/2, 34, 13, TUNE.warnRed, "center");
+    ctx.globalAlpha = 1;
+    var pw = W*0.5, px = (W - pw)/2, py = 58, ph = 6;
+    ctx.strokeStyle = TUNE.hudDim; ctx.lineWidth = 1.5; ctx.strokeRect(px, py, pw, ph);
+    ctx.fillStyle = TUNE.hudAmber; ctx.fillRect(px + 1, py + 1, (pw - 2) * clamp(canyonDist / TUNE.canyonLength, 0, 1), ph - 2);
+  }
+  // -- launch / landing scenes (build 7) --
+  function seaBg(){
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, TUNE.seaTop); g.addColorStop(1, TUNE.seaBottom);
+    ctx.fillStyle = g; ctx.fillRect(-24, -24, W + 48, H + 48);
+  }
+  function drawCarrierDeck(topY){
+    ctx.fillStyle = "#3a4048"; ctx.fillRect(W*0.22, topY, W*0.56, H - topY + 40);
+    ctx.strokeStyle = "#2a2f36"; ctx.lineWidth = 3; ctx.strokeRect(W*0.22, topY, W*0.56, H - topY + 40);
+    ctx.strokeStyle = "rgba(255,255,255,0.32)"; ctx.lineWidth = 3; ctx.setLineDash([14, 12]);
+    ctx.beginPath(); ctx.moveTo(W/2, topY); ctx.lineTo(W/2, H + 40); ctx.stroke(); ctx.setLineDash([]);
+  }
+  function drawLaunchScene(){
+    seaBg(); drawCarrierDeck(H * 0.5);
+    drawTrails(); drawPlayer(); drawParticles();
+    var pulse = 0.5 + 0.5 * Math.sin(elapsed * 10);
+    ctx.globalAlpha = 0.6 + 0.4 * pulse; hudText("CATAPULT — LAUNCH", W/2, H*0.3, 15, TUNE.hudAmber, "center"); ctx.globalAlpha = 1;
+  }
+  function drawLandingScene(){
+    seaBg(); drawCarrierDeck(H * 0.62);
+    var cx = W/2, corrHalf = W*0.12;
+    ctx.strokeStyle = "rgba(255,191,71,0.5)"; ctx.lineWidth = 2; ctx.setLineDash([10, 8]);
+    ctx.beginPath(); ctx.moveTo(cx - corrHalf, H*0.4); ctx.lineTo(cx - corrHalf, H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx + corrHalf, H*0.4); ctx.lineTo(cx + corrHalf, H); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.strokeStyle = landHold > 0 ? TUNE.hudAmber : TUNE.hudDim; ctx.lineWidth = 2;
+    ctx.strokeRect(cx - corrHalf, H*0.68, corrHalf*2, H*0.13);
+    drawTrails(); drawPlayer(); drawParticles();
+    hudText("ALIGN & HOLD", W/2, H*0.30, 15, TUNE.hudAmber, "center");
+    var mw = W*0.5, mx = (W-mw)/2, my = H*0.35, mh = 8;
+    ctx.strokeStyle = TUNE.hudDim; ctx.lineWidth = 1.5; ctx.strokeRect(mx, my, mw, mh);
+    ctx.fillStyle = TUNE.hudAmber; ctx.fillRect(mx + 1, my + 1, (mw - 2) * landHold, mh - 2);
+  }
+  // -- briefing + radio comms (build 8) --
+  function wrapText(text, x, y, maxW, lh){
+    ctx.font = "500 13px -apple-system, monospace"; ctx.textAlign = "left";
+    var words = text.split(" "), line = "", yy = y, n = 0;
+    for (var i = 0; i < words.length; i++){
+      var test = line ? line + " " + words[i] : words[i];
+      if (ctx.measureText(test).width > maxW && line){ ctx.fillText(line, x, yy); yy += lh; line = words[i]; n++; }
+      else line = test;
+    }
+    if (line){ ctx.fillText(line, x, yy); n++; }
+    return n;
+  }
+  function drawBriefing(){
+    ctx.fillStyle = "#0a0e13"; ctx.fillRect(0, 0, W, H);
+    hudText("★ SECTOR 1 — COASTAL APPROACH", W/2, 56, 11, TUNE.warnRed, "center");
+    hudText("OPERATION: RIPTIDE", W/2, 76, 22, TUNE.hudAmber, "center");
+    hudText("OBJECTIVE", 24, 126, 10, TUNE.hudDim, "left");
+    ctx.fillStyle = "#dfe8ec"; ctx.font = "500 13px -apple-system, monospace"; ctx.textAlign = "left";
+    ctx.fillText("Suppress the coastal air-defence net.", 24, 154);
+    ctx.fillText("Destroy the anomalous node. Return.", 24, 174);
+    hudText("LOADOUT", 24, 204, 10, TUNE.hudDim, "left");
+    ctx.fillStyle = "#dfe8ec"; ctx.fillText("Cannon · Heat-seeker · Bomb · Flares", 24, 232);
+    var start = Math.max(0, briefIndex - 4), y = 288;
+    for (var i = start; i < briefIndex && i < BRIEF.length; i++){
+      var ln = BRIEF[i];
+      var col = ln.s === "COMMANDER" ? TUNE.hudAmber : ln.s === "SUPPORT" ? "#58e5ff" : "#dfe8ec";
+      hudText(ln.s, 24, y, 9, col, "left");
+      ctx.fillStyle = "#c8d2d8";
+      var n = wrapText(ln.t, 24, y + 22, W - 48, 17);
+      y += 22 + n*17 + 14;
+    }
+    var pulse = 0.5 + 0.5 * Math.sin(elapsed * 6);
+    ctx.globalAlpha = 0.55 + 0.45 * pulse;
+    hudText(briefIndex >= BRIEF.length ? "TAP TO LAUNCH" : "TAP TO CONTINUE", W/2, H - 64, 13, TUNE.hudAmber, "center");
+    ctx.globalAlpha = 1;
+  }
+  function drawRadio(){
+    if (radioTimer <= 0) return;
+    ctx.globalAlpha = Math.min(1, radioTimer) * 0.92;
+    var pw = W - 40, px = 20, py = 76, ph = 30;
+    ctx.fillStyle = "rgba(8,12,16,0.9)"; ctx.fillRect(px, py, pw, ph);
+    ctx.strokeStyle = TUNE.hudAmber; ctx.lineWidth = 1; ctx.strokeRect(px, py, pw, ph);
+    var col = radioSpeaker === "COMMANDER" ? TUNE.hudAmber : radioSpeaker === "SUPPORT" ? "#58e5ff" : "#dfe8ec";
+    hudText(radioSpeaker, px + 8, py + 2, 8, col, "left");
+    ctx.font = "500 11px -apple-system, monospace"; ctx.textAlign = "left"; ctx.fillStyle = "#dfe8ec";
+    ctx.fillText(radioText, px + 8, py + 24);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawBullets(){
+    ctx.globalCompositeOperation = "lighter";
+    for (var b = 0; b < bullets.length; b++){
+      var pb = bullets[b]; if (pb.dead) continue;
+      blitGlow(glowPlayer, pb.x, pb.y, 0.7);
+      ctx.fillStyle = TUNE.playerShot;
+      ctx.fillRect(pb.x - 1.5, pb.y - 7, 3, 12);
+    }
+    for (var eb = 0; eb < enemyBullets.length; eb++){
+      var ebu = enemyBullets[eb]; if (ebu.dead) continue;
+      blitGlow(glowEnemy, ebu.x, ebu.y, 0.8);
+      ctx.fillStyle = TUNE.enemyShot;
+      ctx.beginPath(); ctx.arc(ebu.x, ebu.y, 3.5, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.globalCompositeOperation = "source-over";
+  }
+
+  function drawParticles(){
+    ctx.globalCompositeOperation = "lighter";
+    for (var p = 0; p < particles.length; p++){
+      var pt = particles[p]; if (pt.dead) continue;
+      var a = pt.life / pt.max;
+      blitGlow(glowSpark, pt.x, pt.y, 0.5 * a + 0.2);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = pt.color;
+      ctx.fillRect(pt.x - pt.size/2, pt.y - pt.size/2, pt.size, pt.size);
+      ctx.globalAlpha = 1;
+    }
+    ctx.globalCompositeOperation = "source-over";
+  }
+
+  // ===== HUD (stencil/military instrumentation) ========================
+  function drawHUD(){
+    // ARMOUR bar, top-left, in a hard-edged bracket. Amber → red when low.
+    var bx = 16, by = 18, bw = 150, bh = 12;
+    var frac = clamp(player.hp / TUNE.playerHP, 0, 1);
+    var low = frac <= 0.3;
+    ctx.strokeStyle = TUNE.hudDim; ctx.lineWidth = 1.5;
+    ctx.strokeRect(bx, by, bw, bh);
+    ctx.fillStyle = low ? TUNE.warnRed : TUNE.hudAmber;
+    ctx.fillRect(bx + 1, by + 1, (bw - 2) * frac, bh - 2);
+    hudText("ARMOUR", bx, by - 6, 10, TUNE.hudDim, "left");
+    // low-armour warning: red screen-edge vignette
+    if (low && player.hp > 0){
+      ctx.strokeStyle = "rgba(232,65,47," + (0.25 + 0.2*Math.sin(elapsed*10)).toFixed(2) + ")";
+      ctx.lineWidth = 6; ctx.strokeRect(3, 3, W - 6, H - 6);
+    }
+
+    // SCORE, top-right
+    hudText("SCORE", W - 16, by - 6, 10, TUNE.hudDim, "right");
+    hudText(String(score), W - 16, by + 14, 22, TUNE.hudAmber, "right");
+
+    // WEAPON buttons + threat readouts — only in the fight (build 7 gate)
+    if (phase === 'combat' || phase === 'canyon'){
+    // WEAPON buttons in the thumb corners (build 4)
+    // A2A heat-seeker (bottom-right) — up-missile glyph + ammo
+    var a2 = a2aButton(); var a2ok = a2aAmmo > 0 && a2aTimer <= 0;
+    ctx.strokeStyle = a2ok ? TUNE.hudAmber : TUNE.hudDim; ctx.lineWidth = 2;
+    ctx.strokeRect(a2.x - a2.r, a2.y - a2.r, a2.r*2, a2.r*2);
+    ctx.fillStyle = a2ok ? TUNE.hudAmber : TUNE.hudDim;
+    ctx.beginPath(); ctx.moveTo(a2.x, a2.y - 10); ctx.lineTo(a2.x - 6, a2.y + 2); ctx.lineTo(a2.x + 6, a2.y + 2); ctx.closePath(); ctx.fill();
+    hudText(String(a2aAmmo), a2.x, a2.y + 6, 11, a2ok ? TUNE.hudAmber : TUNE.hudDim, "center");
+    // Flare countermeasure (bottom-left) — starburst glyph + charges
+    var fl = flareButton(); var flok = flares > 0 && flareTimer <= 0;
+    ctx.strokeStyle = flok ? TUNE.hudAmber : TUNE.hudDim; ctx.lineWidth = 2;
+    ctx.strokeRect(fl.x - fl.r, fl.y - fl.r, fl.r*2, fl.r*2);
+    ctx.strokeStyle = flok ? TUNE.spark : TUNE.hudDim; ctx.lineWidth = 2;
+    for (var fi = 0; fi < 6; fi++){ var fa = fi * Math.PI/3; ctx.beginPath(); ctx.moveTo(fl.x, fl.y - 5); ctx.lineTo(fl.x + Math.cos(fa)*8, fl.y - 5 + Math.sin(fa)*8); ctx.stroke(); }
+    hudText(String(flares), fl.x, fl.y + 9, 11, flok ? TUNE.hudAmber : TUNE.hudDim, "center");
+    // Bomb (bottom-right, above A2A) — red star + charges
+    var bb = bombButton(); var can = bombs > 0;
+    ctx.strokeStyle = can ? TUNE.hudAmber : TUNE.hudDim; ctx.lineWidth = 2;
+    ctx.strokeRect(bb.x - bb.r, bb.y - bb.r, bb.r*2, bb.r*2);
+    ctx.fillStyle = can ? TUNE.warnRed : TUNE.hudDim;
+    star(bb.x, bb.y - 4, 9);
+    hudText(String(bombs), bb.x, bb.y + 6, 11, can ? TUNE.hudAmber : TUNE.hudDim, "center");
+
+    if (phase === 'combat') hudText(bossSpawned ? "DESTROY THE DEFENCE NODE" : "SUPPRESS THE AIR-DEFENCE NET", W/2, 4, 9, TUNE.hudDim, "center");
+    drawRadio();
+    drawMissileWarning();
+    drawBossBar();
+    }
+    if (phase === 'canyon') drawCanyonHud();
+  }
+  // directional warning: pulsing red arrow (player → nearest incoming missile) + banner
+  function drawMissileWarning(){
+    var m = null, best = 1e9;
+    for (var i = 0; i < missiles.length; i++){
+      var mm = missiles[i]; if (mm.dead) continue;
+      var d = (mm.x-player.x)*(mm.x-player.x) + (mm.y-player.y)*(mm.y-player.y);
+      if (d < best){ best = d; m = mm; }
+    }
+    if (!m) return;
+    var pulse = 0.5 + 0.5 * Math.sin(elapsed * 14);
+    var a = Math.atan2(m.y - player.y, m.x - player.x);
+    ctx.save();
+    ctx.translate(player.x + Math.cos(a) * 48, player.y + Math.sin(a) * 48); ctx.rotate(a);
+    ctx.globalAlpha = 0.4 + 0.6 * pulse; ctx.fillStyle = TUNE.warnRed;
+    ctx.beginPath(); ctx.moveTo(13, 0); ctx.lineTo(-6, -7); ctx.lineTo(-6, 7); ctx.closePath(); ctx.fill();
+    ctx.restore();
+    ctx.globalAlpha = 0.5 + 0.5 * pulse;
+    hudText("MISSILE", W / 2, 34, 13, TUNE.warnRed, "center");
+    ctx.globalAlpha = 1;
+  }
+  function hudText(t, x, y, size, color, align){
+    ctx.fillStyle = color;
+    ctx.font = "700 " + size + "px -apple-system, monospace";
+    ctx.textAlign = align; ctx.textBaseline = "alphabetic";
+    ctx.fillText(t, x, y + size);
+  }
+
+  function render(){
+    if (state === "briefing"){ drawBriefing(); return; }
+    ctx.save();
+    if (shake > 0){ ctx.translate((Math.random()*2-1) * shake, (Math.random()*2-1) * shake); }
+    if (phase === 'canyon'){
+      drawCanyonScene();
+    } else if (phase === 'launch'){
+      drawLaunchScene();
+    } else if (phase === 'landing'){
+      drawLandingScene();
+    } else {
+      drawTerrain();
+      if (state === "play" || state === "results"){
+        drawTrails();
+        for (var e = 0; e < enemies.length; e++){ if (!enemies[e].dead) drawEnemy(enemies[e]); }
+        if (boss) drawBoss();
+        drawBullets();
+        drawMissiles();
+        drawPlayerMissiles();
+        drawPlayer();
+        drawParticles();
+        drawRings();
+      }
+    }
+    ctx.restore();               // HUD is NOT shaken — instrumentation stays rock-steady
+    if (state === "play" || state === "results") drawHUD();
+    // hit flash (full-screen, on top)
+    if (hitFlash > 0){
+      ctx.fillStyle = "rgba(" + flashColor + "," + (hitFlash * 2).toFixed(2) + ")";
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+  function drawTrails(){
+    ctx.globalCompositeOperation = "lighter";
+    for (var i = 0; i < trails.length; i++){
+      var tt = trails[i]; if (tt.dead) continue;
+      var a = tt.life / tt.max;
+      ctx.globalAlpha = a * 0.5;
+      ctx.fillStyle = tt.color;
+      ctx.beginPath(); ctx.arc(tt.x, tt.y, tt.size * a, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+  }
+  function drawRings(){
+    for (var i = 0; i < rings.length; i++){
+      var rg = rings[i]; if (rg.dead) continue;
+      var a = rg.life / rg.max;
+      ctx.globalAlpha = a;
+      ctx.strokeStyle = rg.color; ctx.lineWidth = 3 * a + 0.5;
+      ctx.beginPath(); ctx.arc(rg.x, rg.y, rg.r, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ===== small shape helpers ===========================================
+  function roundRect(x, y, w, h, r){
+    r = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  function star(cx, cy, r){
+    ctx.beginPath();
+    for (var i = 0; i < 5; i++){
+      var a = -Math.PI/2 + i * (Math.PI * 4 / 5); // 5-point star
+      var px = cx + Math.cos(a) * r, py = cy + Math.sin(a) * r;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath(); ctx.fill();
+  }
+
+
+  // ===== MAIN LOOP =====================================================
+  var lastT = null;
+  function frame(t){
+    if (lastT === null) lastT = t;
+    var dt = Math.min(0.033, (t - lastT) / 1000); // clamp so a stall can't teleport things
+    lastT = t;
+    if (state === "play"){
+      if (hitStop > 0) hitStop -= dt;   // frozen frames for impact weight (build 2)
+      else update(dt);
+    }
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
